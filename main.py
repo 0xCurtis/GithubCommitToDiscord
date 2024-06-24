@@ -1,70 +1,127 @@
-import requests
-from datetime import datetime, timedelta
-import os
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
 from dotenv import load_dotenv
+from filelock import FileLock
+import os
+import json
+import datetime
 
+# Load environment variables from .env file
 load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN')
+GUILD_ID = int(os.getenv('GUILD_ID'))
+CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
+DATA_FILE = 'data.json'
+LOCK_FILE = 'data.lock'
 
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
-DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
-PREVIOUS_DAYS = 6
-HEADERS = {
-    'Authorization': f'token {GITHUB_TOKEN}',
-    'Accept': 'application/vnd.github.v3+json'
-}
+# Intents for the bot
+intents = discord.Intents.default()
+intents.message_content = True
 
-def get_commit_count(github_user):
-    now = datetime.utcnow()
-    start_time = now - timedelta(days=PREVIOUS_DAYS)
-    
-    total_commit_count = 0
+# Create a bot instance
+bot = commands.Bot(command_prefix='/', intents=intents)
 
-    # Get the user's repos
-    repos_url = f'https://api.github.com/users/{github_user}/repos'
-    repos_response = requests.get(repos_url, headers=HEADERS)
-    repos = repos_response.json()
+class MyClient(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tree = app_commands.CommandTree(self)
 
-    for repo in repos:
-        repo_name = repo['name']
-        owner = repo['owner']['login']
-        commit_activity_url = f'https://api.github.com/repos/{owner}/{repo_name}/stats/commit_activity'
-        
-        commit_activity_response = requests.get(commit_activity_url, headers=HEADERS)
-        commit_activity = commit_activity_response.json()
-        
-        for week in commit_activity:
-            week_start = datetime.utcfromtimestamp(week['week'])
-            if week_start > start_time:
-                total_commit_count += week['total']
+    async def setup_hook(self):
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
 
-    return total_commit_count
+client = MyClient(intents=intents)
 
-def get_commit_counts_for_users(users):
-    counts = {}
-    for github_user, discord_user in users.items():
-        counts[discord_user] = get_commit_count(github_user)
-    return counts
+@client.event
+async def on_ready():
+    print(f'Logged in as {client.user}!')
+    daily_stats.start()
 
-def send_discord_message(commit_counts):
-    sorted_counts = sorted(commit_counts.items(), key=lambda x: x[1], reverse=True)
-    description = "\n".join([f"{discord_user}: {count} commits" for discord_user, count in sorted_counts])
+@client.tree.command()
+async def ping(interaction: discord.Interaction):
+    """Replies with Pong!"""
+    await interaction.response.send_message('Pong!')
 
-    embed = {
-        "title": f"GitHub Commit Counts (Last {PREVIOUS_DAYS} days)",
-        "description": description,
-        "color": 5814783
-    }
+@client.tree.command()
+async def add_account(interaction: discord.Interaction, account_name: str, user: discord.User):
+    """Adds an account with a name and a user."""
+    with FileLock(LOCK_FILE):
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+        else:
+            data = {}
 
-    data = {
-        "embeds": [embed]
-    }
+        data[user.id] = account_name
 
-    response = requests.post(DISCORD_WEBHOOK_URL, json=data)
-    if response.status_code == 204:
-        print("Message sent successfully")
-    else:
-        print(f"Failed to send message: {response.status_code}, {response.text}")
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
 
-users_to_monitor = {'0xCurtis': "@0xCurtis"}
-commit_counts = get_commit_counts_for_users(users_to_monitor)
-send_discord_message(commit_counts)
+    await interaction.response.send_message(f'Account "{account_name}" has been linked to {user.mention}')
+
+from fetch import fetch_github_contributions_for_user
+
+@client.tree.command()
+async def fetch_stats(interaction: discord.Interaction):
+    """Fetches the GitHub stats for the user."""
+    with FileLock(LOCK_FILE):
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+        else:
+            data = {}
+    response_strings = ""
+    for user_id, account_name in data.items():
+        user = await client.fetch_user(user_id)
+        today = datetime.date.today()
+        stats = fetch_github_contributions_for_user(account_name)
+        response_strings += f'{user.mention} has made {stats} contributions today!\n'
+    await interaction.response.send_message(response_strings)
+
+@client.tree.command()
+async def remove_account(interaction: discord.Interaction, user: discord.User):
+    """Removes an account for a user."""
+    with FileLock(LOCK_FILE):
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+        else:
+            data = {}
+
+        if user.id in data:
+            del data[user.id]
+
+            with open(DATA_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+
+    await interaction.response.send_message(f'Account has been unlinked from {user.mention}')
+
+@client.tree.command()
+async def list_accounts(interaction: discord.Interaction, user: discord.User):
+    """Lists all the accounts linked to users."""
+    with FileLock(LOCK_FILE):
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+        else:
+            data = {}
+
+    accounts = '\n'.join([f'{user.mention}: {account_name}' for _, account_name in data.items()])
+    await interaction.response.send_message(f'Linked accounts:\n{accounts}')
+
+@tasks.loop(time=datetime.time(23, 42))
+async def daily_stats():
+    with FileLock(LOCK_FILE):
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+        else:
+            data = {}
+    print(data)
+    channel = client.get_channel(CHANNEL_ID)
+    await channel.send("Gathered commit stats of the day!")
+
+
+client.run(TOKEN)
